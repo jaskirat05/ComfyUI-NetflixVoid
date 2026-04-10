@@ -235,7 +235,7 @@ class VoidPrepareVLMAnalysis:
 
         masked_grid_first_tensor = _uint8_image_to_tensor(masked_grid_first).unsqueeze(0)
         reference_frames_tensor = torch.stack([_uint8_image_to_tensor(frame) for frame in reference_frames], dim=0)
-        qwen_input_frames = torch.cat([reference_frames_tensor, masked_grid_first_tensor], dim=0)
+        qwen_input_frames = torch.cat([masked_grid_first_tensor, reference_frames_tensor], dim=0)
         prompt = _make_vlm_analysis_prompt(
             instruction=instruction,
             grid_rows=grid_rows,
