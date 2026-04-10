@@ -100,40 +100,302 @@ def _overlay_primary_mask(image, black_mask_frame):
     return cv2.addWeighted(result, 0.6, overlay, 0.4, 0)
 
 
+def _get_vlm_system_prompt():
+    return "You are an expert video analyst with deep understanding of physics and object interactions. Always output valid JSON only."
+
+
 def _make_vlm_analysis_prompt(instruction: str, grid_rows: int, grid_cols: int, has_multi_frame_grids: bool = True):
     if has_multi_frame_grids:
         grid_context = f"""
-1. Multiple grid reference frames sampled through the video.
-   - Each frame shows a yellow grid with {grid_rows} rows x {grid_cols} columns.
-   - Grid cells are labeled (row, col) starting from (0, 0) at top-left.
-2. One masked first frame.
-   - The primary object to remove is highlighted in red.
-3. Analyze what else is affected if that primary object is removed.
-"""
+1. **Multiple Grid Reference Frames**: Sampled frames at 0%, 11%, 22%, 33%, 44%, 56%, 67%, 78%, 89%, 100% of video
+   - Each frame shows YELLOW GRID with {grid_rows} rows × {grid_cols} columns
+   - Grid cells labeled (row, col) starting from (0, 0) at top-left
+   - Frame number shown at bottom
+   - Use these to locate objects that appear MID-VIDEO and track object positions across time
+2. **First Frame with RED mask**: Shows what will be REMOVED (primary object)
+3. **Full Video**: Complete action and interactions"""
     else:
         grid_context = f"""
-1. One masked first frame with yellow grid.
-   - Grid size is {grid_rows} rows x {grid_cols} columns.
-   - The primary object to remove is highlighted in red.
-"""
+1. **First Frame with Grid**: PRIMARY OBJECT highlighted in RED + GRID OVERLAY
+   - The red overlay shows what will be REMOVED (already masked)
+   - Yellow grid with {grid_rows} rows × {grid_cols} columns
+   - Grid cells are labeled (row, col) starting from (0, 0) at top-left
+2. **Full Video**: Complete scene and action"""
 
     return f"""
 You are an expert video analyst specializing in physics and object interactions.
-Return valid JSON only.
 
-CONTEXT:
+═══════════════════════════════════════════════════════════════════
+CONTEXT
+═══════════════════════════════════════════════════════════════════
+
+You will see MULTIPLE inputs:
 {grid_context}
+
 Edit instruction: "{instruction}"
 
-TASK:
-1. Identify integral belongings that should be removed together with the primary object.
-2. Identify affected objects or visual artifacts caused by the primary object.
-3. For each affected object decide whether it will move after removal.
-4. For visual artifacts, provide grid_localizations across the reference frames.
-5. For moving physical objects, provide object_size_grids and trajectory_path in grid coordinates.
-6. Describe the final scene after removal.
+IMPORTANT: Some objects may NOT appear in first frame. They may enter later.
+Watch the ENTIRE video and note when each object first appears.
 
-OUTPUT JSON FORMAT:
+═══════════════════════════════════════════════════════════════════
+YOUR TASK
+═══════════════════════════════════════════════════════════════════
+
+Analyze what would happen if the PRIMARY OBJECT (shown in red) is removed.
+Watch the ENTIRE video to see all interactions and movements.
+
+STEP 1: IDENTIFY INTEGRAL BELONGINGS (0-3 items)
+─────────────────────────────────────────────────
+Items that should be ADDED to the primary removal mask (removed WITH primary object):
+
+✓ INCLUDE:
+  • Distinct wearable items: hat, backpack, jacket (if separate/visible)
+  • Vehicles/equipment being ridden: bike, skateboard, surfboard, scooter
+  • Large carried items that are part of the subject
+
+✗ DO NOT INCLUDE:
+  • Generic clothing (shirt, pants, shoes) - already captured with person
+  • Held items that could be set down: guitar, cup, phone, tools
+  • Objects they're interacting with but not wearing/riding
+
+Examples:
+  • Person on bike → integral: "bike"
+  • Person with guitar → integral: none (guitar is affected, not integral)
+  • Surfer → integral: "surfboard"
+  • Boxer → integral: "boxing gloves" (wearable equipment)
+
+STEP 2: IDENTIFY AFFECTED OBJECTS (0-5 objects)
+────────────────────────────────────────────────
+Objects/effects that are SEPARATE from primary but affected by its removal.
+
+CRITICAL: Do NOT include integral belongings from Step 1.
+
+Two categories:
+
+A) VISUAL ARTIFACTS (disappear when primary removed):
+   • shadow, reflection, wake, ripples, splash, footprints
+   • These vanish completely - no physics needed
+
+   **CRITICAL FOR VISUAL ARTIFACTS:**
+   You MUST provide GRID LOCALIZATIONS across the reference frames.
+   Keyword segmentation fails to isolate specific shadows/reflections.
+
+   For each visual artifact:
+   - Look at each grid reference frame you were shown
+   - Identify which grid cells the artifact occupies in EACH frame
+   - List all grid cells (row, col) that contain any part of it
+   - Be thorough - include ALL touched cells (over-mask is better than under-mask)
+
+   Format:
+   {{
+     "noun": "shadow",
+     "category": "visual_artifact",
+     "grid_localizations": [
+       {{"frame": 0, "grid_regions": [{{"row": 6, "col": 3}}, {{"row": 6, "col": 4}}, ...]}},
+       {{"frame": 5, "grid_regions": [{{"row": 6, "col": 4}}, ...]}},
+       // ... for each reference frame shown
+     ]
+   }}
+
+B) PHYSICAL OBJECTS (may move, fall, or stay):
+
+   CRITICAL - Understand the difference:
+
+   **SUPPORTING vs ACTING ON:**
+   • SUPPORTING = holding UP against gravity → object WILL FALL when removed
+     Examples: holding guitar, carrying cup, person sitting on chair
+     → will_move: TRUE
+
+   • ACTING ON = touching/manipulating but object rests on stable surface → object STAYS
+     Examples: hand crushing can (can on table), hand opening can (can on counter),
+              hand pushing object (object on floor)
+     → will_move: FALSE
+
+   **Key Questions:**
+   1. Is the primary object HOLDING THIS UP against gravity?
+      - YES → will_move: true, needs_trajectory: true
+      - NO → Check next question
+
+   2. Is this object RESTING ON a stable surface (table, floor, counter)?
+      - YES → will_move: false (stays on surface when primary removed)
+      - NO → will_move: true
+
+   3. Is the primary object DOING an action TO this object?
+      - Opening can, crushing can, pushing button, turning knob
+      - When primary removed → action STOPS, object stays in current state
+      - will_move: false
+
+   **SPECIAL CASE - Object Currently Moving But Should Have Stayed:**
+   If primary object CAUSES another object to move (hitting, kicking, throwing):
+   - The object is currently moving in the video
+   - But WITHOUT primary, it would have stayed at its original position
+   - You MUST provide:
+     • "currently_moving": true
+     • "should_have_stayed": true
+     • "original_position_grid": {{"row": R, "col": C}} - Where it started
+
+   Examples:
+   - Golf club hits ball → Ball at tee, then flies (mark original tee position)
+   - Person kicks soccer ball → Ball on ground, then rolls (mark original ground position)
+   - Hand throws object → Object held, then flies (mark original held position)
+
+   Format:
+   {{
+     "noun": "golf ball",
+     "category": "physical",
+     "currently_moving": true,
+     "should_have_stayed": true,
+     "original_position_grid": {{"row": 6, "col": 7}},
+     "why": "ball was stationary until club hit it"
+   }}
+
+   For each physical object, determine:
+   - **will_move**: true ONLY if object will fall/move when support removed
+   - **first_appears_frame**: frame number object first appears (0 if from start)
+   - **why**: Brief explanation of relationship to primary object
+
+   IF will_move=TRUE, also provide GRID-BASED TRAJECTORY:
+   - **object_size_grids**: {{"rows": R, "cols": C}} - How many grid cells object occupies
+     IMPORTANT: Add 1 extra cell padding for safety (better to over-mask than under-mask)
+     Example: Object looks 2×1 → report as 3×2
+
+   - **trajectory_path**: List of keyframe positions as grid coordinates
+     Format: [{{"frame": N, "grid_row": R, "grid_col": C}}, ...]
+     - IMPORTANT: First keyframe should be at first_appears_frame (not frame 0 if object appears later!)
+     - Provide 3-5 keyframes spanning from first appearance to end
+     - (grid_row, grid_col) is the CENTER position of object at that frame
+     - Use the yellow grid reference frames to determine positions
+     - For objects appearing mid-video: use the grid samples to locate them
+     - Example: Object appears at frame 15, falls to bottom
+       [{{"frame": 15, "grid_row": 3, "grid_col": 5}},  ← First appearance
+        {{"frame": 25, "grid_row": 6, "grid_col": 5}},  ← Mid-fall
+        {{"frame": 35, "grid_row": 9, "grid_col": 5}}]  ← On ground
+
+✓ Objects held/carried at ANY point in video
+✓ Objects the primary supports or interacts with
+✓ Visual effects visible at any time
+
+✗ Background objects never touched
+✗ Other people/animals with no contact
+✗ Integral belongings (already in Step 1)
+
+STEP 3: SCENE DESCRIPTION
+──────────────────────────
+Describe scene WITHOUT the primary object (1-2 sentences).
+Focus on what remains and any dynamic changes (falling objects, etc).
+
+═══════════════════════════════════════════════════════════════════
+OUTPUT FORMAT (STRICT JSON ONLY)
+═══════════════════════════════════════════════════════════════════
+
+EXAMPLES TO LEARN FROM:
+
+Example 1: Person holding guitar
+{{
+  "affected_objects": [
+    {{
+      "noun": "guitar",
+      "will_move": true,
+      "why": "person is SUPPORTING guitar against gravity by holding it",
+      "object_size_grids": {{"rows": 3, "cols": 2}},
+      "trajectory_path": [
+        {{"frame": 0, "grid_row": 4, "grid_col": 5}},
+        {{"frame": 15, "grid_row": 6, "grid_col": 5}},
+        {{"frame": 30, "grid_row": 8, "grid_col": 6}}
+      ]
+    }}
+  ]
+}}
+
+Example 2: Hand crushing can on table
+{{
+  "affected_objects": [
+    {{
+      "noun": "can",
+      "will_move": false,
+      "why": "can RESTS ON TABLE - hand is just acting on it. When hand removed, can stays on table (uncrushed)"
+    }}
+  ]
+}}
+
+Example 3: Hands opening can on counter
+{{
+  "affected_objects": [
+    {{
+      "noun": "can",
+      "will_move": false,
+      "why": "can RESTS ON COUNTER - hands are doing opening action. When hands removed, can stays closed on counter"
+    }}
+  ]
+}}
+
+Example 4: Person sitting on chair
+{{
+  "affected_objects": [
+    {{
+      "noun": "chair",
+      "will_move": false,
+      "why": "chair RESTS ON FLOOR - person sitting on it doesn't make it fall. Chair stays on floor when person removed"
+    }}
+  ]
+}}
+
+Example 5: Person throws ball (ball appears at frame 12)
+{{
+  "affected_objects": [
+    {{
+      "noun": "ball",
+      "category": "physical",
+      "will_move": true,
+      "first_appears_frame": 12,
+      "why": "ball is SUPPORTED by person's hand, then thrown",
+      "object_size_grids": {{"rows": 2, "cols": 2}},
+      "trajectory_path": [
+        {{"frame": 12, "grid_row": 4, "grid_col": 3}},
+        {{"frame": 20, "grid_row": 2, "grid_col": 6}},
+        {{"frame": 28, "grid_row": 5, "grid_col": 8}}
+      ]
+    }}
+  ]
+}}
+
+Example 6: Person with shadow (shadow needs grid localization)
+{{
+  "affected_objects": [
+    {{
+      "noun": "shadow",
+      "category": "visual_artifact",
+      "why": "cast by person on the floor",
+      "will_move": false,
+      "first_appears_frame": 0,
+      "movement_description": "Disappears entirely as visual artifact",
+      "grid_localizations": [
+        {{"frame": 0, "grid_regions": [{{"row": 6, "col": 3}}, {{"row": 6, "col": 4}}, {{"row": 7, "col": 3}}, {{"row": 7, "col": 4}}]}},
+        {{"frame": 12, "grid_regions": [{{"row": 6, "col": 4}}, {{"row": 6, "col": 5}}, {{"row": 7, "col": 4}}]}},
+        {{"frame": 23, "grid_regions": [{{"row": 5, "col": 4}}, {{"row": 6, "col": 4}}, {{"row": 6, "col": 5}}]}},
+        {{"frame": 35, "grid_regions": [{{"row": 6, "col": 3}}, {{"row": 6, "col": 4}}, {{"row": 7, "col": 3}}]}},
+        {{"frame": 47, "grid_regions": [{{"row": 6, "col": 3}}, {{"row": 7, "col": 3}}, {{"row": 7, "col": 4}}]}}
+      ]
+    }}
+  ]
+}}
+
+Example 7: Golf club hits ball (Case 4 - currently moving but should stay)
+{{
+  "affected_objects": [
+    {{
+      "noun": "golf ball",
+      "category": "physical",
+      "currently_moving": true,
+      "should_have_stayed": true,
+      "original_position_grid": {{"row": 6, "col": 7}},
+      "first_appears_frame": 0,
+      "why": "ball was stationary on tee until club hit it. Without club, ball would remain at original position."
+    }}
+  ]
+}}
+
+YOUR OUTPUT FORMAT:
 {{
   "edit_instruction": "{instruction}",
   "integral_belongings": [
@@ -144,34 +406,48 @@ OUTPUT JSON FORMAT:
   ],
   "affected_objects": [
     {{
-      "noun": "shadow",
-      "category": "visual_artifact",
-      "why": "cast by the primary object",
-      "will_move": false,
-      "first_appears_frame": 0,
-      "movement_description": "Disappears entirely as visual artifact",
-      "grid_localizations": [
-        {{"frame": 0, "grid_regions": [{{"row": 6, "col": 3}}]}}
-      ]
-    }},
-    {{
       "noun": "guitar",
       "category": "physical",
-      "why": "primary object is supporting it against gravity",
+      "why": "person is SUPPORTING guitar against gravity by holding it",
       "will_move": true,
       "first_appears_frame": 0,
-      "movement_description": "Falls to the ground after removal",
+      "movement_description": "Will fall from held position to the ground",
       "object_size_grids": {{"rows": 3, "cols": 2}},
       "trajectory_path": [
         {{"frame": 0, "grid_row": 3, "grid_col": 6}},
         {{"frame": 20, "grid_row": 6, "grid_col": 6}},
         {{"frame": 40, "grid_row": 9, "grid_col": 7}}
       ]
+    }},
+    {{
+      "noun": "shadow",
+      "category": "visual_artifact",
+      "why": "cast by person on floor",
+      "will_move": false,
+      "first_appears_frame": 0,
+      "movement_description": "Disappears entirely as visual artifact"
     }}
   ],
-  "scene_description": "Describe the scene after removal in 1-2 sentences.",
+  "scene_description": "An acoustic guitar falling to the ground in an empty room. Natural window lighting.",
   "confidence": 0.85
 }}
+
+CRITICAL REMINDERS:
+• Watch ENTIRE video before answering
+• SUPPORTING vs ACTING ON:
+  - Primary HOLDS UP object against gravity → will_move=TRUE (provide grid trajectory)
+  - Primary ACTS ON object (crushing, opening) but object on stable surface → will_move=FALSE
+  - Object RESTS ON stable surface (table, floor) → will_move=FALSE
+• For visual artifacts (shadow, reflection): will_move=false (no trajectory needed)
+• For held objects (guitar, cup): will_move=true (MUST provide object_size_grids + trajectory_path)
+• For objects on surfaces being acted on (can being crushed, can being opened): will_move=false
+• Grid trajectory: Add +1 cell padding to object size (over-mask is better than under-mask)
+• Grid trajectory: Use the yellow grid overlay to determine (row, col) positions
+• Be conservative - when in doubt, DON'T include
+• Output MUST be valid JSON only
+
+GRID INFO: {grid_rows} rows × {grid_cols} columns
+EDIT INSTRUCTION: {instruction}
 """.strip()
 
 
@@ -190,11 +466,13 @@ class VoidPrepareVLMAnalysis:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING", "INT", "INT")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING", "STRING", "STRING", "INT", "INT")
     RETURN_NAMES = (
         "masked_grid_first_frame",
         "grid_reference_frames",
         "qwen_input_frames",
+        "vlm_prompt",
+        "system_prompt",
         "prompt",
         "grid_rows",
         "grid_cols",
@@ -236,16 +514,20 @@ class VoidPrepareVLMAnalysis:
         masked_grid_first_tensor = _uint8_image_to_tensor(masked_grid_first).unsqueeze(0)
         reference_frames_tensor = torch.stack([_uint8_image_to_tensor(frame) for frame in reference_frames], dim=0)
         qwen_input_frames = torch.cat([masked_grid_first_tensor, reference_frames_tensor], dim=0)
+        system_prompt = _get_vlm_system_prompt()
         prompt = _make_vlm_analysis_prompt(
             instruction=instruction,
             grid_rows=grid_rows,
             grid_cols=grid_cols,
             has_multi_frame_grids=use_multi_frame_grids,
         )
+        vlm_prompt = f"{system_prompt}\n\n{prompt}"
         return (
             masked_grid_first_tensor,
             reference_frames_tensor,
             qwen_input_frames,
+            vlm_prompt,
+            system_prompt,
             prompt,
             grid_rows,
             grid_cols,
