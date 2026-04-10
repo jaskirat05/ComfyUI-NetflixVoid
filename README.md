@@ -1,10 +1,12 @@
 # VOID ComfyUI Nodes
 
-This package currently provides three minimal ComfyUI nodes:
+This package currently provides five ComfyUI nodes:
 
 - `VOID Export Black Mask`
 - `VOID Prepare VLM Analysis`
 - `VOID Parse VLM Analysis`
+- `VOID Build Grey Mask`
+- `VOID Combine Quadmask`
 
 ## Intended wiring
 
@@ -17,6 +19,10 @@ This package currently provides three minimal ComfyUI nodes:
 5. Feed `qwen_input_frames` and `prompt` into the `1038lab` `QwenVL` node.
 6. Feed the raw text output from `QwenVL` into:
    - `VOID Parse VLM Analysis`
+7. Feed `affected_objects_json`, `images`, `black_mask_video`, and `LoadSAM3Model.sam3_model_config` into:
+   - `VOID Build Grey Mask`
+8. Feed `black_mask_video` and `grey_mask_video` into:
+   - `VOID Combine Quadmask`
 
 ## Node outputs
 
@@ -50,3 +56,28 @@ Cleans and validates QwenVL's JSON response and returns:
 - `affected_objects_json`
 - `scene_description`
 - `confidence`
+
+### `VOID Build Grey Mask`
+
+Builds Stage 3 grey masks using:
+
+- direct grid localization for visual artifacts
+- trajectory rasterization for moving objects
+- direct SAM3 text grounding on the first frame for physical nouns
+
+It returns:
+
+- `grey_mask_video` as an `IMAGE` batch
+- `grey_mask_mask` as a `MASK` batch
+- `grey_debug` as a debug overlay image
+
+### `VOID Combine Quadmask`
+
+Combines Stage 1 and Stage 3 outputs into the final quadmask tensor values:
+
+- `0` primary object
+- `63` overlap
+- `127` affected only
+- `255` background
+
+returned as normalized tensors.
