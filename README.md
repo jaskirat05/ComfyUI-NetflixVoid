@@ -2,6 +2,7 @@
 
 This package currently provides five ComfyUI nodes:
 
+- `VOID Load SAM3 Model`
 - `VOID Export Black Mask`
 - `VOID Prepare VLM Analysis`
 - `VOID Parse VLM Analysis`
@@ -19,7 +20,7 @@ This package currently provides five ComfyUI nodes:
 5. Feed `qwen_input_frames` and `prompt` into the `1038lab` `QwenVL` node.
 6. Feed the raw text output from `QwenVL` into:
    - `VOID Parse VLM Analysis`
-7. Feed `affected_objects_json`, `images`, `black_mask_video`, and `LoadSAM3Model.sam3_model_config` into:
+7. Feed `affected_objects_json`, `images`, `black_mask_video`, and `VOID Load SAM3 Model.sam3_model_config` into:
    - `VOID Build Grey Mask`
 8. Feed `black_mask_video` and `grey_mask_video` into:
    - `VOID Combine Quadmask`
@@ -38,6 +39,12 @@ It returns:
 - `black_mask_video` as an `IMAGE` batch
 - `black_mask_mask` as a `MASK` batch
 - `first_frame` as a single-frame `IMAGE`
+
+### `VOID Load SAM3 Model`
+
+Returns a local `sam3_model_config` object for the vendored SAM3 wrapper.
+This package vendors the minimal SAM3 wrapper/model code needed for Stage 3,
+so it does not require the separate `ComfyUI-SAM3` node pack to be installed.
 
 ### `VOID Prepare VLM Analysis`
 
