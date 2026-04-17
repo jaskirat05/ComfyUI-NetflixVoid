@@ -1,8 +1,17 @@
 import json
 
 import cv2
-import numpy as np
 import torch
+from .gemma4_runtime import DEFAULT_MODEL_ID, run_video_inference
+from .pq5_model_video_nodes import VoidPQ5LoadModel, VoidPQ5EncodeVideo
+from .pq5_prompt_sampler_decode_nodes import (
+    VoidPQ5Settings,
+    VoidPQ5EncodePrompt,
+    VoidPQ5Sampler,
+    VoidPQ5DecodeVideo,
+    VoidPQ5UnloadCache,
+)
+from .pq5_quadmask_nodes import VoidPQ5EncodeQuadmask
 from .sam3_logic import VoidLoadSAM3Model, VoidBuildGreyMask
 
 
@@ -466,14 +475,12 @@ class VoidPrepareVLMAnalysis:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING", "STRING", "STRING", "INT", "INT")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING", "INT", "INT")
     RETURN_NAMES = (
         "masked_grid_first_frame",
         "grid_reference_frames",
         "qwen_input_frames",
         "vlm_prompt",
-        "system_prompt",
-        "prompt",
         "grid_rows",
         "grid_cols",
     )
@@ -513,7 +520,11 @@ class VoidPrepareVLMAnalysis:
 
         masked_grid_first_tensor = _uint8_image_to_tensor(masked_grid_first).unsqueeze(0)
         reference_frames_tensor = torch.stack([_uint8_image_to_tensor(frame) for frame in reference_frames], dim=0)
-        qwen_input_frames = torch.cat([masked_grid_first_tensor, reference_frames_tensor], dim=0)
+        qwen_input_frames = (
+            torch.cat([masked_grid_first_tensor, reference_frames_tensor], dim=0)
+            if use_multi_frame_grids
+            else reference_frames_tensor
+        )
         system_prompt = _get_vlm_system_prompt()
         prompt = _make_vlm_analysis_prompt(
             instruction=instruction,
@@ -527,8 +538,6 @@ class VoidPrepareVLMAnalysis:
             reference_frames_tensor,
             qwen_input_frames,
             vlm_prompt,
-            system_prompt,
-            prompt,
             grid_rows,
             grid_cols,
         )
@@ -553,6 +562,20 @@ def _cleanup_json_response(raw: str):
         return json.loads(cleaned[start:end + 1])
 
 
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class VoidParseVLMAnalysis:
     @classmethod
     def INPUT_TYPES(cls):
@@ -575,12 +598,13 @@ class VoidParseVLMAnalysis:
 
     def parse(self, raw_response):
         parsed = _cleanup_json_response(raw_response)
+        confidence = max(0.0, min(1.0, _safe_float(parsed.get("confidence", 0.0), 0.0)))
         result = {
             "edit_instruction": str(parsed.get("edit_instruction", "")).strip(),
             "integral_belongings": [],
             "affected_objects": [],
             "scene_description": str(parsed.get("scene_description", "")).strip(),
-            "confidence": float(parsed.get("confidence", 0.0)),
+            "confidence": confidence,
         }
 
         for item in parsed.get("integral_belongings", [])[:3]:
@@ -598,7 +622,7 @@ class VoidParseVLMAnalysis:
                 "category": str(item.get("category", "physical")).strip().lower(),
                 "why": str(item.get("why", "")).strip()[:200],
                 "will_move": bool(item.get("will_move", False)),
-                "first_appears_frame": int(item.get("first_appears_frame", 0)),
+                "first_appears_frame": _safe_int(item.get("first_appears_frame", 0), 0),
                 "movement_description": str(item.get("movement_description", "")).strip()[:300],
             }
 
@@ -609,16 +633,19 @@ class VoidParseVLMAnalysis:
             if "original_position_grid" in item:
                 grid = item.get("original_position_grid", {})
                 obj["original_position_grid"] = {
-                    "row": int(grid.get("row", 0)),
-                    "col": int(grid.get("col", 0)),
+                    "row": _safe_int(grid.get("row", 0), 0),
+                    "col": _safe_int(grid.get("col", 0), 0),
                 }
             if "grid_localizations" in item:
                 grid_localizations = []
                 for loc in item.get("grid_localizations", []):
-                    frame_loc = {"frame": int(loc.get("frame", 0)), "grid_regions": []}
+                    frame_loc = {"frame": _safe_int(loc.get("frame", 0), 0), "grid_regions": []}
                     for region in loc.get("grid_regions", []):
                         frame_loc["grid_regions"].append(
-                            {"row": int(region.get("row", 0)), "col": int(region.get("col", 0))}
+                            {
+                                "row": _safe_int(region.get("row", 0), 0),
+                                "col": _safe_int(region.get("col", 0), 0),
+                            }
                         )
                     if frame_loc["grid_regions"]:
                         grid_localizations.append(frame_loc)
@@ -627,16 +654,16 @@ class VoidParseVLMAnalysis:
             if obj["will_move"] and "object_size_grids" in item and "trajectory_path" in item:
                 size_grids = item.get("object_size_grids", {})
                 obj["object_size_grids"] = {
-                    "rows": int(size_grids.get("rows", 2)),
-                    "cols": int(size_grids.get("cols", 2)),
+                    "rows": _safe_int(size_grids.get("rows", 2), 2),
+                    "cols": _safe_int(size_grids.get("cols", 2), 2),
                 }
                 trajectory = []
                 for point in item.get("trajectory_path", []):
                     trajectory.append(
                         {
-                            "frame": int(point.get("frame", 0)),
-                            "grid_row": int(point.get("grid_row", 0)),
-                            "grid_col": int(point.get("grid_col", 0)),
+                            "frame": _safe_int(point.get("frame", 0), 0),
+                            "grid_row": _safe_int(point.get("grid_row", 0), 0),
+                            "grid_col": _safe_int(point.get("grid_col", 0), 0),
                         }
                     )
                 if trajectory:
@@ -698,6 +725,37 @@ class VoidCombineQuadmask:
         return (quadmask_video, quad)
 
 
+class VoidGemma4VideoPrompt:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": "Describe this video in detail."}),
+                "max_frames": ("INT", {"default": 24, "min": 1, "max": 256, "step": 1}),
+                "max_new_tokens": ("INT", {"default": 512, "min": 1, "max": 8192, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "generate"
+    CATEGORY = "VOID"
+
+    def generate(self, video, prompt, max_frames, max_new_tokens):
+        text, sampled_frames = run_video_inference(
+            video=video,
+            prompt=prompt,
+            max_frames=max_frames,
+            max_new_tokens=max_new_tokens,
+        )
+        if not text:
+            raise RuntimeError(
+                f"Gemma 4 returned an empty response for model `{DEFAULT_MODEL_ID}` using {sampled_frames} sampled frames."
+            )
+        return (text,)
+
+
 NODE_CLASS_MAPPINGS = {
     "VoidLoadSAM3Model": VoidLoadSAM3Model,
     "VoidExportBlackMask": VoidExportBlackMask,
@@ -705,6 +763,15 @@ NODE_CLASS_MAPPINGS = {
     "VoidParseVLMAnalysis": VoidParseVLMAnalysis,
     "VoidBuildGreyMask": VoidBuildGreyMask,
     "VoidCombineQuadmask": VoidCombineQuadmask,
+    "VoidGemma4VideoPrompt": VoidGemma4VideoPrompt,
+    "VoidPQ5LoadModel": VoidPQ5LoadModel,
+    "VoidPQ5Settings": VoidPQ5Settings,
+    "VoidPQ5EncodePrompt": VoidPQ5EncodePrompt,
+    "VoidPQ5EncodeVideo": VoidPQ5EncodeVideo,
+    "VoidPQ5EncodeQuadmask": VoidPQ5EncodeQuadmask,
+    "VoidPQ5Sampler": VoidPQ5Sampler,
+    "VoidPQ5DecodeVideo": VoidPQ5DecodeVideo,
+    "VoidPQ5UnloadCache": VoidPQ5UnloadCache,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -714,4 +781,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VoidParseVLMAnalysis": "VOID Parse VLM Analysis",
     "VoidBuildGreyMask": "VOID Build Grey Mask",
     "VoidCombineQuadmask": "VOID Combine Quadmask",
+    "VoidGemma4VideoPrompt": "VOID Gemma 4 E2B Video Prompt",
+    "VoidPQ5LoadModel": "VOID PQ5 Load Model",
+    "VoidPQ5Settings": "VOID PQ5 Settings",
+    "VoidPQ5EncodePrompt": "VOID PQ5 Encode Prompt",
+    "VoidPQ5EncodeVideo": "VOID PQ5 Encode Video",
+    "VoidPQ5EncodeQuadmask": "VOID PQ5 Encode Quadmask",
+    "VoidPQ5Sampler": "VOID PQ5 Sampler",
+    "VoidPQ5DecodeVideo": "VOID PQ5 Decode Video",
+    "VoidPQ5UnloadCache": "VOID PQ5 Unload Cache",
 }

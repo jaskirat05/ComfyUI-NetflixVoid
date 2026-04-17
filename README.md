@@ -1,6 +1,14 @@
-# VOID ComfyUI Nodes
+# ComfyUI-NetflixVoid
 
-This package currently provides five ComfyUI nodes:
+Custom ComfyUI nodes for the VOID workflow:
+
+1. Stage 1: black mask
+2. Stage 2: VLM prep + parse
+3. Stage 3: grey mask
+4. Stage 4: quadmask
+5. Stage 5: modular PQ5 inference
+
+## Included nodes
 
 - `VOID Load SAM3 Model`
 - `VOID Export Black Mask`
@@ -8,83 +16,44 @@ This package currently provides five ComfyUI nodes:
 - `VOID Parse VLM Analysis`
 - `VOID Build Grey Mask`
 - `VOID Combine Quadmask`
+- `VOID Gemma 4 E2B Video Prompt`
+- `VOID PQ5 Load Model`
+- `VOID PQ5 Settings`
+- `VOID PQ5 Encode Prompt`
+- `VOID PQ5 Encode Video`
+- `VOID PQ5 Encode Quadmask`
+- `VOID PQ5 Sampler`
+- `VOID PQ5 Decode Video`
+- `VOID PQ5 Unload Cache`
 
-## Intended wiring
+## PQ5 assets and models
 
-1. Use KJ `PointsEditor` to place points.
-2. Use Kijai SAM2.1 video segmentation nodes to produce the propagated `MASK`.
-3. Feed the original video `IMAGE` batch and the propagated `MASK` into:
-   - `VOID Export Black Mask`
-4. Feed the original video and `black_mask_video` into:
-   - `VOID Prepare VLM Analysis`
-5. Feed `qwen_input_frames` and `prompt` into the `1038lab` `QwenVL` node.
-6. Feed the raw text output from `QwenVL` into:
-   - `VOID Parse VLM Analysis`
-7. Feed `affected_objects_json`, `images`, `black_mask_video`, and `VOID Load SAM3 Model.sam3_model_config` into:
-   - `VOID Build Grey Mask`
-8. Feed `black_mask_video` and `grey_mask_video` into:
-   - `VOID Combine Quadmask`
+This repo now uses a modular PQ5 layout.
 
-## Node outputs
+Required locations:
 
-### `VOID Export Black Mask`
+- Transformer checkpoint: `ComfyUI/models/checkpoints` (select in `VOID PQ5 Load Model`)
+- VAE checkpoint: `ComfyUI/models/vae` (select in `VOID PQ5 Load Model`)
+- Text encoder folder: `ComfyUI/models/text_encoders/void`
+- Repo-local PQ5 configs/tokenizer/scheduler: `ComfyUI-NetflixVoid/pq5_assets`
 
-Converts the propagated foreground mask into VOID Stage 1 tensors:
+## Recommended modular wiring (PQ5)
 
-- object / foreground = `0`
-- background = `255`
+1. `VOID PQ5 Load Model` -> `model`
+2. `VOID PQ5 Encode Prompt` with `model` + prompt text
+3. `VOID PQ5 Encode Video` with `model` + input video
+4. `VOID PQ5 Encode Quadmask` with quadmask video
+5. `VOID PQ5 Sampler` with `model`, prompt embeds, encoded video, encoded quadmask, and settings
+6. `VOID PQ5 Decode Video` with `model`, sampler `latents`, and `original_frame_count`
 
-It returns:
+For pass 2:
 
-- `black_mask_video` as an `IMAGE` batch
-- `black_mask_mask` as a `MASK` batch
-- `first_frame` as a single-frame `IMAGE`
+- Load a second model using pass-2 checkpoint in `VOID PQ5 Load Model`
+- Feed pass-1 output video into `VOID PQ5 Encode Video`
+- Reuse/refine quadmask and run sampler+decode again
 
-### `VOID Load SAM3 Model`
+## Notes
 
-Returns a local `sam3_model_config` object for the vendored SAM3 wrapper.
-This package vendors the minimal SAM3 wrapper/model code needed for Stage 3,
-so it does not require the separate `ComfyUI-SAM3` node pack to be installed.
-
-### `VOID Prepare VLM Analysis`
-
-Builds the Stage 2 reference frames:
-
-- a masked + gridded first frame
-- multiple gridded sample frames across the clip
-- a Stage 2 prompt string for QwenVL
-
-### `VOID Parse VLM Analysis`
-
-Cleans and validates QwenVL's JSON response and returns:
-
-- normalized `analysis_json`
-- `integral_belongings_json`
-- `affected_objects_json`
-- `scene_description`
-- `confidence`
-
-### `VOID Build Grey Mask`
-
-Builds Stage 3 grey masks using:
-
-- direct grid localization for visual artifacts
-- trajectory rasterization for moving objects
-- direct SAM3 text grounding on the first frame for physical nouns
-
-It returns:
-
-- `grey_mask_video` as an `IMAGE` batch
-- `grey_mask_mask` as a `MASK` batch
-- `grey_debug` as a debug overlay image
-
-### `VOID Combine Quadmask`
-
-Combines Stage 1 and Stage 3 outputs into the final quadmask tensor values:
-
-- `0` primary object
-- `63` overlap
-- `127` affected only
-- `255` background
-
-returned as normalized tensors.
+- `VOID PQ5 Load Model` has no fallback for missing checkpoint/VAE/text-encoder paths.
+- Use `VOID PQ5 Unload Cache` to clear cached PQ5 pipelines and free memory.
+- Keep `grid_rows/grid_cols` from `VOID Prepare VLM Analysis` connected to `VOID Build Grey Mask`.

@@ -81,6 +81,21 @@ def _mask_to_bool(mask):
     return np.asarray(mask) > 0.5
 
 
+def _parse_affected_objects_json(raw: str):
+    text = str(raw).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("`affected_objects_json` is not valid JSON.") from exc
+    if isinstance(parsed, dict):
+        return parsed.get("affected_objects", [])
+    if isinstance(parsed, list):
+        return parsed
+    raise ValueError("`affected_objects_json` must be either a JSON list or an object with `affected_objects`.")
+
+
 def _grid_cells_to_mask(grid_cells, grid_rows, grid_cols, frame_width, frame_height):
     mask = np.zeros((frame_height, frame_width), dtype=bool)
     cell_width = frame_width / grid_cols
@@ -229,10 +244,7 @@ class VoidBuildGreyMask:
                 f"Shape mismatch: images {tuple(images.shape)} vs black_mask_video {tuple(black_mask_video.shape)}."
             )
 
-        analysis = json.loads(affected_objects_json) if affected_objects_json.strip().startswith("{") else {
-            "affected_objects": json.loads(affected_objects_json)
-        }
-        affected_objects = analysis.get("affected_objects", [])
+        affected_objects = _parse_affected_objects_json(affected_objects_json)
 
         grey_masks = [np.zeros((frame_height, frame_width), dtype=bool) for _ in range(frame_count)]
         primary_mask = _mask_to_bool(1.0 - black_mask_video[0, ..., 0])
