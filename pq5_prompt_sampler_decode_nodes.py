@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from .pq5.runtime import clear_pipeline_cache
 
@@ -114,7 +115,31 @@ class VoidPQ5Sampler:
 
         generator.manual_seed(int(seed))
 
-        sample_size = tuple(int(x) for x in config.data.sample_size)
+        if encoded_video.ndim != 5 or encoded_quadmask.ndim != 5:
+            raise ValueError(
+                "Expected `encoded_video` and `encoded_quadmask` to be 5D tensors [B,C,T,H,W]. "
+                f"Got {tuple(encoded_video.shape)} and {tuple(encoded_quadmask.shape)}."
+            )
+
+        if int(encoded_video.shape[2]) != int(encoded_quadmask.shape[2]):
+            raise ValueError(
+                "Encoded video and mask must have the same frame count. "
+                f"Got video T={int(encoded_video.shape[2])}, mask T={int(encoded_quadmask.shape[2])}. "
+                "Use matching max_video_length/temporal_window_size settings."
+            )
+
+        sample_size = (int(encoded_quadmask.shape[-2]), int(encoded_quadmask.shape[-1]))
+        if sample_size[0] % 8 != 0 or sample_size[1] % 8 != 0:
+            raise ValueError(
+                f"Mask resolution must be divisible by 8, got HxW={sample_size[0]}x{sample_size[1]}."
+            )
+
+        if tuple(int(x) for x in encoded_video.shape[-2:]) != sample_size:
+            b, c, t, _, _ = encoded_video.shape
+            video_frames = encoded_video.permute(0, 2, 1, 3, 4).reshape(b * t, c, encoded_video.shape[-2], encoded_video.shape[-1])
+            video_frames = F.interpolate(video_frames, size=sample_size, mode="area")
+            encoded_video = video_frames.reshape(b, t, c, sample_size[0], sample_size[1]).permute(0, 2, 1, 3, 4)
+
         result = pipeline(
             prompt=None,
             negative_prompt=None,
